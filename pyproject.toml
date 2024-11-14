@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "lvfs-mirror"
+version = "0.1.0"
+description = "Mirror for LVFS repositories (used for fwupd)."
+authors = ["Sebastian Endres <dev@sedrubal.de>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+urllib3 = "^2.2.3"
+
+[tool.poetry.group.dev.dependencies]
+pylint = "^3.3.1"
+isort = "^5.13.2"
+black = "^24.8.0"
+mypy = "^1.11.2"
+ruff = "^0.6.8"
+pyre-check = "^0.9.22"
+pre-commit = "^3.8.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+lvfs-mirror = "lvfs_mirror.lvfs_mirror:main"
+
+[tool.isort]
+profile = "black"
+
+# [tool.mypy]
+# ignore_missing_imports = true
