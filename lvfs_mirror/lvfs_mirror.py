@@ -1,7 +1,12 @@
-"""Mirror LVFS repositories for fwupd."""
+"""
+Mirror LVFS repositories for fwupd.
+
+This tools works with lvfs metadata files.
+The specification can be found here:
+https://lvfs.readthedocs.io/en/latest/metainfo.html
+"""
 
 import argparse
-import fnmatch
 import gzip
 import hashlib
 import logging
@@ -9,17 +14,19 @@ import os
 import re
 import sys
 import typing
-from configparser import ConfigParser
-from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from xml.etree import ElementTree
+import socket
 
 import urllib3
 from packaging.version import InvalidVersion, Version
 
+from .config import Config, Remote, parse_config
 from .utils import (
     TerminalLineUpdater,
+    filter_component_id,
+    filter_vendor_id,
     get_metadata_mtime,
     human_file_size,
     local_file_exists_and_up_to_date,
@@ -28,38 +35,7 @@ from .utils import (
 LOGGER = logging.getLogger()
 
 
-DOWNLOAD_CHUNK_SIZE = 1024 * 1024
-
-
-@dataclass
-class Remote:
-    """A LVFS remote."""
-
-    name: str
-    title: str
-    metadata_uri: str
-
-
-@dataclass
-class Config:
-    """The configuration."""
-
-    #: Path to directory, where firmware and metadata will be stored.
-    mirror_root: Path
-
-    #: URL under which MirrorRoot can be reached from other clients.
-    root_url: str
-
-    #: Parsed remote configurations.
-    #: The syntax and directory structure of fwupd itself can be used here.
-    remotes: list[Remote]
-
-    #: Download only firmware which match the these ID patterns.
-    filter_ids: list[re.Pattern]
-
-    #: Limit the amount of old firmware versions that is downloaded per firmware ID.
-    #: Does not delete old firmware files.
-    keep_versions: int | None
+DOWNLOAD_CHUNK_SIZE = 1024
 
 
 class LVFSMirror:
@@ -68,6 +44,7 @@ class LVFSMirror:
     def __init__(
         self,
         filter_ids: list[re.Pattern],
+        filter_vendor_ids: list[str],
         remotes: list[Remote],
         mirror_root: Path,
         root_url: str,
@@ -75,9 +52,18 @@ class LVFSMirror:
         keep_versions: int | None = 1,
     ):
         self.filter_ids = filter_ids
+        self.filter_vendor_ids = filter_vendor_ids
         self.remotes = remotes
         self.mirror_root = mirror_root
-        self.session = urllib3.PoolManager()
+        self.session = urllib3.PoolManager(
+            headers=urllib3.util.make_headers(
+                keep_alive=True, user_agent="lvfs-mirror"
+            ),
+            socket_options=urllib3.connection.HTTPConnection.default_socket_options
+            + [
+                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+            ],
+        )
         self.force = force
         self.keep_versions = keep_versions
         self.root_url = root_url
@@ -257,21 +243,69 @@ class LVFSMirror:
             return
         component_id = component_id_element.text
 
-        if self.filter_ids:
-            for id_re in self.filter_ids:
-                if id_re.match(component_id):
+        if not filter_component_id(component_id, self.filter_ids):
+            self._skipped_components += 1
+            return
+
+        requires_element = component.find("requires")
+        if requires_element is None:
+            LOGGER.warning(
+                "Component %s has no <requires> block. Ignoring.", component_id
+            )
+            return
+        for condition_element in requires_element:
+            if condition_element.tag == "firmware":
+                if not condition_element.text:
+                    # This is a requirement on another installed firmware.
+                    # We can't use this condition on the mirror as we don't know,
+                    # which firmware is installed on the client.
+                    continue
+
+                if condition_element.text.strip() != "vendor-id":
                     LOGGER.debug(
-                        "Pattern %s matches component ID %s",
-                        id_re.pattern,
-                        component_id,
+                        "Unsupported requirement condition %s.",
+                        ElementTree.tostring(condition_element).decode("utf8"),
                     )
-                    break
+                    continue
+
+                condition_compare = condition_element.attrib.get("compare")
+                condition_version = condition_element.attrib.get("version")
+
+                if not condition_compare or not condition_version:
+                    LOGGER.warning(
+                        "Missing compare and/or version attribute for <firmware>vendor-id</firmare> requirement."
+                    )
+                    continue
+                elif filter_vendor_id(
+                    condition_version.upper(),
+                    condition_compare.lower(),
+                    self.filter_vendor_ids,
+                ):
+                    continue
+                else:
+                    self._skipped_components += 1
+                    return
+            elif (
+                condition_element.tag == "id"
+                and condition_element.text
+                and condition_element.text.strip() == "org.freedesktop.fwupd"
+            ):
+                # download firmware for all versions of fwupd
+                continue
+            elif condition_element.tag == "hardware":
+                # Filtering by computer hardware (ID?) is not yet supported.
+                # I don't know how I can get a list of computer hardware IDs of devices on my computer.
+                continue
+            elif condition_element.tag == "client":
+                # This is used if this update requires user interaction.
+                # We don't filter by this condition.
+                continue
             else:
-                LOGGER.debug(
-                    "Skipping component ID %s (no pattern matches ID)", component_id
+                LOGGER.warning(
+                    "Unknown requires condition: %s",
+                    ElementTree.tostring(condition_element).decode("utf8"),
                 )
-                self._skipped_components += 1
-                return
+                continue
 
         releases_element = component.find("releases")
         if releases_element is None:
@@ -284,59 +318,7 @@ class LVFSMirror:
             LOGGER.warning("No <release> found in component %s", component_id)
             return
 
-        if self.keep_versions:
-            elements_with_sort_key: list[
-                tuple[Version | None, list[str], ElementTree.Element]
-            ] = []
-            use_fallback = False
-            for release in release_elements:
-                version_str = release.attrib.get("version")
-                if not version_str:
-                    LOGGER.warning(
-                        "Component %s has release with invalid version %s",
-                        component_id,
-                        version_str,
-                    )
-                    continue
-                version: Version | None = None
-                try:
-                    version = Version(version_str)
-                except InvalidVersion as exc:
-                    LOGGER.warning(
-                        (
-                            "Component %s has release with invalid version %s (%s). "
-                            "Version sort might not be accurate."
-                        ),
-                        component_id,
-                        version_str,
-                        exc,
-                    )
-                    use_fallback = True
-                version_fallback: list[str] = version_str.split(".")
-                elements_with_sort_key.append((version, version_fallback, release))
-
-            elements_with_sort_key.sort(
-                reverse=True,
-                key=lambda entry: entry[1] if use_fallback else entry[0],  # type: ignore
-            )
-
-            num_all_versions = len(release_elements)
-            release_elements = []
-            versions: list[str] = []
-            for version, version_fallback, release_element in elements_with_sort_key[
-                : self.keep_versions
-            ]:
-                release_elements.append(release_element)
-                versions.append(".".join(version_fallback))
-
-            if num_all_versions < len(elements_with_sort_key):
-                LOGGER.debug(
-                    "Keeping only %i of %i most recent versions of %s: %s",
-                    len(elements_with_sort_key),
-                    num_all_versions,
-                    component_id,
-                    ", ".join(versions),
-                )
+        release_elements = self.exclude_old_versions(release_elements, component_id)
 
         for release in release_elements:
             location = release.find("location")
@@ -385,12 +367,6 @@ class LVFSMirror:
                         continue
                     checksums[checksum_type.lower()] = checksum_value.lower()
 
-            LOGGER.debug(
-                "Found following checksums for %s: %s",
-                release_url_str,
-                ", ".join(checksums.keys()),
-            )
-
             size: int | None = None
             for size_element in release.findall("size"):
                 if size_element.attrib.get("type") == "download" and size_element.text:
@@ -410,6 +386,143 @@ class LVFSMirror:
             # elif self.prune_metadata:
             # -> remove from metadata
 
+    def exclude_old_versions(
+        self, release_elements: list[ElementTree.Element], component_id: str
+    ) -> list[ElementTree.Element]:
+        """
+        If keep_versions is set, this will exclude old release versions.
+
+        It filters a list of release elements from metadata XML.
+        """
+
+        if not self.keep_versions or len(release_elements) <= self.keep_versions:
+            return release_elements
+
+        EntryT = tuple[
+            Version | None,
+            int | None,
+            int | None,
+            list[str] | None,
+            ElementTree.Element,
+        ]
+        elements_with_sort_key: list[EntryT] = []
+
+        version_usable = True
+        timestamp_usable = True
+        id_usable = True
+        version_fallback_usable = True
+
+        for release in release_elements:
+            version: Version | None = None
+            timestamp: int | None = None
+            release_id: int | None = None
+            version_fallback: list[str] | None = None
+
+            version_str = release.attrib.get("version")
+            timestamp_str = release.attrib.get("timestamp")
+            id_str = release.attrib.get("id")
+
+            if version_str:
+                version_fallback = version_str.split(".")
+
+                try:
+                    version = Version(version_str)
+                except InvalidVersion as exc:
+                    LOGGER.warning(
+                        (
+                            "Component %s has release with invalid version %s (%s). "
+                            "Version sort might not be accurate."
+                        ),
+                        component_id,
+                        version_str,
+                        exc,
+                    )
+                    version_usable = False
+            else:
+                LOGGER.warning(
+                    "Component %s has release with invalid version %s",
+                    component_id,
+                    version_str,
+                )
+                version_usable = False
+                version_fallback_usable = False
+
+            try:
+                timestamp = int(timestamp_str or "")
+            except ValueError as err:
+                LOGGER.warning(
+                    "Component %s has release with invalid timestamp %s (%s)",
+                    component_id,
+                    timestamp_str,
+                    err,
+                )
+                timestamp_usable = False
+
+            try:
+                release_id = int(id_str or "")
+            except ValueError as err:
+                LOGGER.warning(
+                    "Component %s has release with invalid id %s (%s)",
+                    component_id,
+                    id_str,
+                    err,
+                )
+                id_usable = False
+
+            elements_with_sort_key.append(
+                (version, timestamp, release_id, version_fallback, release)
+            )
+
+        if version_usable:
+            sort_idx = 0
+        elif timestamp_usable:
+            sort_idx = 1
+        elif id_usable:
+            sort_idx = 2
+        elif version_fallback_usable:
+            sort_idx = 3
+        else:
+            LOGGER.warning(
+                "Did not find a useable sort criteria for the release versions of component %s. Will download all versions.",
+                component_id,
+            )
+            return release_elements
+
+        if sort_idx > 0:
+            LOGGER.warning(
+                "Can't reliably sort release versions of component %s by their version. Latest version might not be available.",
+                component_id,
+            )
+
+        elements_with_sort_key.sort(
+            reverse=True,
+            key=lambda entry: typing.cast(Version | int | list[str], entry[sort_idx]),
+        )
+
+        num_all_versions = len(release_elements)
+        release_elements = []
+        versions: list[str] = []
+        for (
+            version,
+            _timestamp,
+            _release_id,
+            version_fallback,
+            release_element,
+        ) in elements_with_sort_key[: self.keep_versions]:
+            release_elements.append(release_element)
+            versions.append(".".join(version_fallback) if version_fallback else "???")
+
+        if num_all_versions < len(elements_with_sort_key):
+            LOGGER.debug(
+                "Keeping only %i of %i most recent versions of %s: %s",
+                len(elements_with_sort_key),
+                num_all_versions,
+                component_id,
+                ", ".join(versions),
+            )
+
+        return release_elements
+
     def download_and_verify_file(
         self,
         url: str,
@@ -427,13 +540,18 @@ class LVFSMirror:
                 LOGGER.warning("Unsupported checksum %s.", checksum_type)
                 continue
             checksums[checksum_type] = hashlib.new(checksum_type)
+        checksums_str = ", ".join(checksums.keys())
 
         if not self.force and local_file_exists_and_up_to_date(
             expected_checksums=expected_checksums,
             expected_size=expected_size,
             file_path=output_file,
         ):
-            LOGGER.debug("File %s is up to date and valid.", output_file)
+            LOGGER.debug(
+                "File %s is up to date and valid (checksums %s match).",
+                output_file,
+                checksums_str,
+            )
             return output_file
 
         resp = self.session.request("GET", url, preload_content=False)
@@ -483,7 +601,8 @@ class LVFSMirror:
 
             tmp_file.rename(output_file)
             printer.update(
-                f"Downloaded and verified {output_file}", on_non_terminals=True
+                f"Downloaded and verified {output_file} with checksums {checksums_str}",
+                on_non_terminals=True,
             )
 
         return output_file
@@ -505,97 +624,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force overwriting output (even if it seems to be up to date).",
     )
-    parser.add_argument(
+
+    verbosity_group = parser.add_mutually_exclusive_group()
+    verbosity_group.add_argument(
         "-d",
         "--debug",
         action="store_true",
         help="Enable debug output.",
     )
+    verbosity_group.add_argument(
+        "-q",
+        "--quiet",
+        "--silent",
+        action="store_true",
+        help="Mute output (print only warnings and errors).",
+    )
 
     return parser.parse_args()
 
 
-MAIN_SECTION = "mirror"
-REMOTE_SECTION = "fwupd Remote"
-
-
-def parse_config(main_config_file: Path) -> Config:
-    """Parse config files."""
-
-    main_cfg = ConfigParser()
-    main_cfg.read(main_config_file)
-    main_section = main_cfg[MAIN_SECTION]
-    filter_ids: list[re.Pattern] = [
-        re.compile(fnmatch.translate(entry.strip()), re.IGNORECASE)
-        for entry in main_section.get("FilterIds", fallback="").strip().split(",")
-        if entry.strip()
-    ]
-    mirror_root = Path(main_section.get("MirrorRoot", fallback="/srv/lvfs_mirror/"))
-    root_url = main_section.get("RootUrl", fallback="http://localhost:8000/")
-    keep_versions_str = main_section.get("KeepVersions", fallback="1")
-    if keep_versions_str == "all":
-        keep_versions: int | None = None
-    else:
-        keep_versions = int(keep_versions_str)
-    remotes_dir = Path(main_section.get("RemotesDir", fallback="/etc/fwupd/remotes.d/"))
-
-    if not remotes_dir.is_absolute():
-        remotes_dir = main_config_file.parent / remotes_dir
-
-    cfg = Config(
-        filter_ids=filter_ids,
-        mirror_root=mirror_root,
-        root_url=root_url,
-        keep_versions=keep_versions,
-        remotes=[],
-    )
-
-    for file in remotes_dir.iterdir():
-        if not file.is_file() or not file.suffix == ".conf":
-            continue
-
-        remote_cfg = ConfigParser()
-        remote_cfg.read(file)
-
-        if REMOTE_SECTION not in remote_cfg:
-            LOGGER.info("No remote found in %s. Ignoring file.", file)
-
-            continue
-        remote_cfg_sec = remote_cfg[REMOTE_SECTION]
-
-        if not remote_cfg_sec.getboolean("Enabled", fallback=True):
-            LOGGER.info("Remote in %s is not enabled. Ignoring file.", file)
-
-            continue
-
-        if "MetadataURI" not in remote_cfg_sec:
-            LOGGER.warning("MetadataURI is missing in %s. Ignoring remote.", file)
-
-            continue
-        metadata_uri = remote_cfg_sec["MetadataURI"]
-
-        if not metadata_uri.startswith("https://") and not metadata_uri.startswith(
-            "http://"
-        ):
-            LOGGER.warning(
-                "MetadataURI %s in %s is not a HTTPS/HTTP URI. Ignoring remote.",
-                metadata_uri,
-                file,
-            )
-
-            continue
-
-        remote = Remote(
-            name=file.stem,
-            title=remote_cfg_sec.get("Title", file.stem),
-            metadata_uri=metadata_uri,
-        )
-        cfg.remotes.append(remote)
-
-    return cfg
-
-
-def main():
+def main() -> None:
     """Run the mirror."""
     args = parse_args()
     handler = logging.StreamHandler(sys.stderr)
@@ -603,13 +651,17 @@ def main():
     if args.debug:
         LOGGER.setLevel(logging.DEBUG)
         handler.setLevel(logging.DEBUG)
+    elif args.quiet:
+        LOGGER.setLevel(logging.WARNING)
+        handler.setLevel(logging.WARNING)
     else:
         LOGGER.setLevel(logging.INFO)
         handler.setLevel(logging.INFO)
 
-    cfg = parse_config(args.config)
+    cfg: Config = parse_config(args.config)
     mirror = LVFSMirror(
         filter_ids=cfg.filter_ids,
+        filter_vendor_ids=cfg.filter_vendor_ids,
         remotes=cfg.remotes,
         mirror_root=cfg.mirror_root,
         root_url=cfg.root_url,

@@ -2,6 +2,8 @@
 
 import hashlib
 import logging
+import re
+import fnmatch
 import shutil
 import sys
 from gzip import GzipFile
@@ -95,3 +97,71 @@ class TerminalLineUpdater:
     def __exit__(self, *args, **kwargs):
         if sys.stderr.isatty():
             print(file=sys.stderr)
+
+
+def filter_component_id(component_id: str, filter_patterns: list[re.Pattern]) -> bool:
+    """:Return: True if one of the patterns matches the `component_id`."""
+    if not filter_patterns:
+        return True
+
+    for id_re in filter_patterns:
+        if id_re.match(component_id):
+            LOGGER.debug(
+                "Component ID pattern %s matches component ID %s",
+                id_re.pattern,
+                component_id,
+            )
+            return True
+
+    LOGGER.debug("Skipping component ID %s (no pattern matches ID)", component_id)
+    return False
+
+
+def filter_vendor_id(version: str, compare: str, filter_vendor_ids: list[str]) -> bool:
+    """:Return: True if one of the vendor ids in `filter_vendor_ids` matches the condition."""
+    if not filter_vendor_ids:
+        return True
+
+    if compare == "eq":
+        for vendor_id in filter_vendor_ids:
+            if version == vendor_id:
+                LOGGER.debug("Vendor ID %s is part of the filter list.", version)
+                return True
+
+        LOGGER.debug("Vendor ID %s not in filter list.", version)
+    elif compare in ("regex", "glob"):
+        if compare == "regex":
+            pattern = re.compile(version)
+        else:
+            pattern = re.compile(fnmatch.translate(version), re.IGNORECASE)
+
+        for vendor_id in filter_vendor_ids:
+            if pattern.match(vendor_id):
+                LOGGER.debug(
+                    "Vendor ID %s from filter list matches pattern %s.",
+                    vendor_id,
+                    version,
+                )
+                return True
+
+        LOGGER.debug(
+            "Vendor ID pattern %s doesn't match any of the vendor IDs in filter list.",
+            version,
+        )
+    elif compare == "ne":
+        # can be ignored
+        return True
+    elif compare in ("lt", "le", "gt", "ge"):
+        LOGGER.warning(
+            "Compare function %s (against version %s) not implemented (but also not expected).",
+            compare,
+            version,
+        )
+        return True
+    else:
+        LOGGER.warning(
+            "Unknown compare method %s (against version %s).", compare, version
+        )
+        return True
+
+    return False
