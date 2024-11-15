@@ -1,0 +1,38 @@
+---
+name: Publish Python Package
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: |
+          python -m pip install --user pipx
+          python -m pipx ensurepath
+          pipx install poetry==1.8.3
+
+      - name: Configure Poetry
+        run: |
+          # poetry config repositories.testpypi https://test.pypi.org/legacy/
+          # poetry config pypi-token.testpypi ${{ secrets.PYPI_API_TOKEN }}
+          poetry config pypi-token.pypi ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Install Dependencies
+        run: poetry install
+
+      - name: Build & Publish Package
+        run: poetry publish --build
