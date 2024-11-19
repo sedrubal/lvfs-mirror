@@ -1,9 +1,9 @@
 """Tools to read and parse configuration."""
 
+import configparser
 import fnmatch
 import logging
 import re
-from configparser import ConfigParser
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,11 +37,20 @@ class Config:
     filter_ids: list[re.Pattern]
 
     #: Download only firmware which applies for one of the vendors in this list.
-    filter_vendor_ids: list[str]
+    filter_vendor_ids: frozenset[str]
 
     #: Limit the amount of old firmware versions that is downloaded per firmware ID.
     #: Does not delete old firmware files.
     keep_versions: int | None
+
+    #: Directory of public keys for jcat-tool
+    public_keys_dir: Path
+
+    #: Private keys to sign metadata on the mirror.
+    pkcs7_signing_key: Path
+
+    #: Certificate to key that is used to sign metadata on the mirror.
+    pkcs7_signing_cert: Path
 
 
 MAIN_SECTION = "mirror"
@@ -50,27 +59,53 @@ REMOTE_SECTION = "fwupd Remote"
 
 def parse_config(main_config_file: Path) -> Config:
     """Parse config files."""
+    if not main_config_file.is_file():
+        LOGGER.error("Config file %s is not a file. Using defaults.", main_config_file)
 
-    main_cfg = ConfigParser()
+    main_cfg = configparser.ConfigParser()
     main_cfg.read(main_config_file)
-    main_section = main_cfg[MAIN_SECTION]
+    try:
+        main_section = main_cfg[MAIN_SECTION]
+    except KeyError:
+        LOGGER.fatal(
+            "Config file '%s' does not have a section named '%s'. Using defaults.",
+            main_config_file,
+            MAIN_SECTION,
+        )
+        main_section = configparser.SectionProxy(main_cfg, MAIN_SECTION)
+
     filter_ids: list[re.Pattern] = [
         re.compile(fnmatch.translate(entry.strip()), re.IGNORECASE)
         for entry in main_section.get("FilterIds", fallback="").strip().split(",")
         if entry.strip()
     ]
-    filter_vendor_ids: list[str] = [
+
+    filter_vendor_ids: frozenset[str] = frozenset(
         entry.strip().upper()
         for entry in main_section.get("FilterVendorIds", fallback="").strip().split(",")
         if entry.strip()
-    ]
+    )
+
     mirror_root = Path(main_section.get("MirrorRoot", fallback="/srv/lvfs_mirror/"))
+
     root_url = main_section.get("RootUrl", fallback="http://localhost:8000/")
+
     keep_versions_str = main_section.get("KeepVersions", fallback="1")
     if keep_versions_str == "all":
         keep_versions: int | None = None
     else:
         keep_versions = int(keep_versions_str)
+
+    public_keys_dir = Path(main_section.get("PublicKeys", "/etc/pki/fwupd-metadata/"))
+
+    pkcs7_signing_key = Path(
+        main_section.get("Pkcs7SigningKey", "/etc/ssl/private/lvfs-mirror.key.pem")
+    )
+
+    pkcs7_signing_cert = Path(
+        main_section.get("Pkcs7SigningCert", "/etc/ssl/private/lvfs-mirror.crt.pem")
+    )
+
     remotes_dir = Path(main_section.get("RemotesDir", fallback="/etc/fwupd/remotes.d/"))
 
     if not remotes_dir.is_absolute():
@@ -82,6 +117,9 @@ def parse_config(main_config_file: Path) -> Config:
         mirror_root=mirror_root,
         root_url=root_url,
         keep_versions=keep_versions,
+        public_keys_dir=public_keys_dir,
+        pkcs7_signing_key=pkcs7_signing_key,
+        pkcs7_signing_cert=pkcs7_signing_cert,
         remotes=[],
     )
 
@@ -89,7 +127,7 @@ def parse_config(main_config_file: Path) -> Config:
         if not file.is_file() or not file.suffix == ".conf":
             continue
 
-        remote_cfg = ConfigParser()
+        remote_cfg = configparser.ConfigParser()
         remote_cfg.read(file)
 
         if REMOTE_SECTION not in remote_cfg:

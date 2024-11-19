@@ -11,23 +11,22 @@ import gzip
 import hashlib
 import logging
 import os
-import re
+import socket
 import sys
 import typing
-from email.utils import parsedate_to_datetime
+from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
-import socket
 
 import urllib3
 from packaging.version import InvalidVersion, Version
 
 from .config import Config, Remote, parse_config
+from .jcat import get_jcat_item, jcat_sign_file, jcat_verify_file
 from .utils import (
     TerminalLineUpdater,
     filter_component_id,
     filter_vendor_id,
-    get_metadata_mtime,
     human_file_size,
     local_file_exists_and_up_to_date,
 )
@@ -38,23 +37,23 @@ LOGGER = logging.getLogger()
 DOWNLOAD_CHUNK_SIZE = 1024
 
 
+@dataclass
+class FirmwareBlob:
+    """A description of a firmware blob."""
+
+    url: str
+    expected_checksums: dict[str, str]
+    expected_size: int | None
+    output_path: Path
+
+
 class LVFSMirror:
     """(Command line) tool to mirror LVFS repositories."""
 
-    def __init__(
-        self,
-        filter_ids: list[re.Pattern],
-        filter_vendor_ids: list[str],
-        remotes: list[Remote],
-        mirror_root: Path,
-        root_url: str,
-        force: bool = False,
-        keep_versions: int | None = 1,
-    ):
-        self.filter_ids = filter_ids
-        self.filter_vendor_ids = filter_vendor_ids
-        self.remotes = remotes
-        self.mirror_root = mirror_root
+    def __init__(self, cfg: Config, force: bool = False):
+        self.cfg = cfg
+        self.force = force
+
         self.session = urllib3.PoolManager(
             headers=urllib3.util.make_headers(
                 keep_alive=True, user_agent="lvfs-mirror"
@@ -64,9 +63,6 @@ class LVFSMirror:
                 (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
             ],
         )
-        self.force = force
-        self.keep_versions = keep_versions
-        self.root_url = root_url
 
         # counters
         self._processed_components = 0
@@ -81,7 +77,7 @@ class LVFSMirror:
         self._downloaded_size = 0
         self._processed_repos = 0
 
-        for remote in self.remotes:
+        for remote in self.cfg.remotes:
             self.update_remote(remote)
             self._processed_repos += 1
 
@@ -97,17 +93,83 @@ class LVFSMirror:
         self._processed_components = 0
         self._skipped_components = 0
 
-        root = self.mirror_root / remote.name
+        root = self.cfg.mirror_root / remote.name
+        # create output directories
         root.mkdir(parents=True, exist_ok=True)
-        (root / "downloads").mkdir(parents=True, exist_ok=True)
+        firmware_root = root / "downloads"
+        firmware_root.mkdir(parents=True, exist_ok=True)
+        tmp_root = root / ".tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        tmp_root_in = tmp_root / "in"
+        tmp_root_in.mkdir(parents=True, exist_ok=True)
+        tmp_root_out = tmp_root / "out"
+        tmp_root_out.mkdir(parents=True, exist_ok=True)
+
+        firmware_url_base = f"{self.cfg.root_url.rstrip('/')}/{remote.name}/downloads/"
+
+        remote_url_base = remote.metadata_uri[: remote.metadata_uri.rindex("/")]
+        jcat_url = f"{remote.metadata_uri}.jcat"
+        jcat_file_name = jcat_url[jcat_url.rindex("/") + 1 :]
+
+        jcat_input_path = tmp_root_in / jcat_file_name
+        jcat_output_path = tmp_root_out / jcat_file_name
+        jcat_mirror_path = root / jcat_file_name
+
+        # download jcat file
         try:
-            metadata, src_mtime = self.get_metadata(remote)
+            self.download_file(jcat_url, jcat_input_path)
         except urllib3.exceptions.HTTPError as exc:
             LOGGER.error("Failed to update remote %s: %s", remote.name, exc)
             return
 
-        self.process_metadata(
-            metadata, remote=remote, output_root=root, src_mtime=src_mtime
+        # extract items
+        try:
+            metadata_name = get_jcat_item(jcat_input_path)
+        except ValueError as err:
+            LOGGER.error("Skipping remote %s: %s", remote.name, err)
+            return
+
+        metadata_mirror_path_default = root / "firmware.xml.gz"
+        metadata_mirror_path = root / metadata_name
+        metadata_input_path = tmp_root_in / metadata_name
+        metadata_output_path = tmp_root_out / metadata_name
+
+        if metadata_input_path.is_file() and jcat_verify_file(
+            jcat_input_path, self.cfg.public_keys_dir
+        ):
+            LOGGER.info("Metadata %s is already downloaded and valid.", jcat_input_path)
+        else:
+            try:
+                self.download_file(
+                    f"{remote_url_base}/{metadata_name}", metadata_input_path
+                )
+            except urllib3.exceptions.HTTPError as exc:
+                LOGGER.error("Failed to update remote %s: %s", remote.name, exc)
+                return
+
+            if jcat_verify_file(jcat_input_path, self.cfg.public_keys_dir):
+                # metadata is valid
+                LOGGER.info(
+                    "Successfully downloaded and verified metadata %s.",
+                    metadata_input_path,
+                )
+            else:
+                LOGGER.error(
+                    "Metadata %s downloaded but verification with jcat %s failed. Skipping remote %s",
+                    metadata_input_path,
+                    jcat_input_path,
+                    remote.name,
+                )
+                return
+
+        # process metadata
+        firmware_blobs_to_download = list(
+            self.process_metadata(
+                metadata_input_path=metadata_input_path,
+                metadata_output_path=metadata_output_path,
+                firmware_blob_dir=firmware_root,
+                firmware_url_base=firmware_url_base,
+            )
         )
 
         LOGGER.info(
@@ -116,134 +178,155 @@ class LVFSMirror:
             self._skipped_components,
         )
 
-    def get_metadata(
-        self, remote: Remote
-    ) -> tuple[
-        typing.Union[urllib3.BaseHTTPResponse, gzip.GzipFile], typing.Union[int, None]
-    ]:
-        """
-        Start a request to download and extract the metadata on the fly.
+        # download & verify firmware blobs
+        LOGGER.info(
+            "%i firmware blobs will be made available locally...",
+            len(firmware_blobs_to_download),
+        )
+        total_str = str(len(firmware_blobs_to_download))
+        for idx, firmware_blob in enumerate(firmware_blobs_to_download, start=1):
+            counter = f"[{idx:>{len(total_str)}}/{total_str}]"
+            self.download_and_verify_firmware(firmware_blob, tmp_root, counter)
 
-        :Return: A file like object.
-        """
-        # For debugging this can be used in combination with http.server:
-        # remote.metadata_uri = "http://localhost:8000/firmware.xml.gz"
-        resp = self.session.request("GET", remote.metadata_uri, preload_content=False)
-        data: typing.Union[urllib3.BaseHTTPResponse, gzip.GzipFile]
-        mtime: int | None = None
-        try:
-            date_str: str | None = resp.headers.get("Last-Modified")
-            if date_str:
-                mtime = int(parsedate_to_datetime(date_str).timestamp())
-        except ValueError:
-            mtime = None
+        # sign new metadata
+        jcat_sign_file(
+            metadata_output_path,
+            jcat_output_path,
+            self.cfg.pkcs7_signing_cert,
+            self.cfg.pkcs7_signing_key,
+            # self.cfg.signing_gpg_key,
+        )
 
-        if remote.metadata_uri.endswith(".gz"):
-            # extract data
-            data = gzip.GzipFile(fileobj=resp)
-            # read mtime
-            data.read(1)
-            data.rewind()
-            mtime = data.mtime
-        else:
-            data = resp
+        # "publish" jcat and modified metadata file
+        jcat_output_path.rename(jcat_mirror_path)
+        metadata_output_path.rename(metadata_mirror_path)
+        metadata_mirror_path_default.unlink(missing_ok=True)
+        metadata_mirror_path_default.symlink_to(metadata_name)
 
-        return data, mtime
+    def download_file(self, url: str, output_file: Path) -> None:
+        """Download a file."""
+        resp = self.session.request("GET", url, preload_content=False)
+        size = 0
+
+        with TerminalLineUpdater() as printer:
+            printer.update(
+                f"Downloading {output_file}",
+                on_non_terminals=True,
+            )
+
+            with output_file.open("wb") as file:
+                while chunk := resp.read(DOWNLOAD_CHUNK_SIZE):
+                    printer.update(
+                        f"Downloading {output_file}: {human_file_size(size)}"
+                    )
+                    file.write(chunk)
+                    size += len(chunk)
+
+            printer.update(
+                f"Downloaded {output_file}: {human_file_size(size)}",
+                on_non_terminals=True,
+            )
 
     def process_metadata(
         self,
-        metadata: typing.Union[urllib3.BaseHTTPResponse, gzip.GzipFile, typing.IO],
-        remote: Remote,
-        output_root: Path,
-        src_mtime: int | None,
-    ):
-        """Process the metadata of a repo and download the corresponding firmware files."""
-        output_file: typing.Union[gzip.GzipFile, typing.IO, None] = None
-        output_file_name = (
-            output_root / remote.metadata_uri[remote.metadata_uri.rindex("/") + 1 :]
-        )
-        tmp_file = output_file_name.parent / f".{output_file_name.name}.part"
+        metadata_input_path: Path,
+        metadata_output_path: Path,
+        firmware_blob_dir: Path,
+        firmware_url_base: str,
+    ) -> typing.Generator[FirmwareBlob, None, None]:
+        """
+        Process the metadata of a repo.
 
-        # check if we need to update the output file
-        if (
-            not self.force
-            and src_mtime
-            and output_file_name.is_file()
-            and (dst_mtime := get_metadata_mtime(output_file_name) >= src_mtime)
-        ):
-            LOGGER.info("Local metadata file for remote %s is up to date.", remote.name)
-            LOGGER.debug(
-                "Target file %s newer than source file (%i <= %i)",
-                output_file_name,
-                src_mtime,
-                dst_mtime,
-            )
-            if output_file_name.suffix == ".gz":
-                metadata = gzip.GzipFile(fileobj=output_file_name.open("rb"), mode="rb")
-            else:
-                metadata = output_file_name.open("rb")
+        Write an updated version of the firmware and extract firmware blobs
+        that need to be downloaded.
+        """
+
+        # # check if we need to update the output file
+        # if (
+        #     not self.force
+        #     and src_mtime
+        #     and output_file_name.is_file()
+        #     and (dst_mtime := get_metadata_mtime(output_file_name) >= src_mtime)
+        # ):
+        #     LOGGER.info("Local metadata file for remote %s is up to date.", remote.name)
+        #     LOGGER.debug(
+        #         "Target file %s newer than source file (%i <= %i)",
+        #         output_file_name,
+        #         src_mtime,
+        #         dst_mtime,
+        #     )
+        #     if output_file_name.suffix == ".gz":
+        #         metadata = gzip.GzipFile(fileobj=output_file_name.open("rb"), mode="rb")
+        #     else:
+        #         metadata = output_file_name.open("rb")
+        # else:
+
+        input_file: typing.Union[gzip.GzipFile, typing.IO]
+        src_mtime: int | None = None
+        if metadata_input_path.suffix == ".gz":
+            # extract output
+            input_file = gzip.GzipFile(filename=metadata_input_path, mode="rb")
+            # get gzip mtime
+            input_file.read(1)
+            src_mtime = input_file.mtime
+            input_file.rewind()
         else:
-            if remote.metadata_uri.endswith(".gz"):
-                # compress output
-                output_file = gzip.GzipFile(
-                    filename=tmp_file, mode="wb", mtime=src_mtime
-                )
-            else:
-                output_file = tmp_file.open("wb")
+            input_file = metadata_input_path.open("rb")
+
+        output_file: typing.Union[gzip.GzipFile, typing.IO]
+        if metadata_output_path.suffix == ".gz":
+            # compress output
+            output_file = gzip.GzipFile(
+                filename=metadata_output_path, mode="wb", mtime=src_mtime
+            )
+        else:
+            output_file = metadata_output_path.open("wb")
 
         try:
-            if output_file:
-                # write header
-                output_file.write(
-                    b'<?xml version="1.0" encoding="utf-8"?>'
-                    b'<components origin="lvfs" version="0.9">'
-                )
+            # write header
+            output_file.write(
+                b'<?xml version="1.0" encoding="utf-8"?>'
+                b'<components origin="lvfs" version="0.9">'
+            )
 
             # process components
-            for _event, element in ElementTree.iterparse(metadata):
+            for _event, element in ElementTree.iterparse(input_file):
                 if element.tag == "component":
-                    self.process_component(element, output_root)
+                    yield from self.process_component(
+                        element,
+                        firmware_blob_dir,
+                        firmware_url_base,
+                    )
                     self._processed_components += 1
 
-                    if output_file:
-                        output_file.write(
-                            ElementTree.tostring(
-                                element, encoding="utf8", method="html"
-                            )
-                        )
+                    output_file.write(
+                        ElementTree.tostring(element, encoding="utf8", method="html")
+                    )
 
-            if output_file:
-                # write trailer
-                output_file.write(b"</components>")
+            # write trailer
+            output_file.write(b"</components>")
         finally:
-            if output_file:
-                output_file.close()
-
-        if output_file:
-            tmp_file.rename(output_file_name)
-            LOGGER.info(
-                "Successfully updated and processed repo %s (file %s)",
-                remote.name,
-                output_file_name,
-            )
-        else:
-            LOGGER.info(
-                "Successfully processed repo %s (file %s)",
-                remote.name,
-                output_file_name,
-            )
+            input_file.close()
+            output_file.close()
 
     def process_component(
-        self, component: ElementTree.Element, output_root: Path
-    ) -> None:
-        """Process and update a component which is part of the repo metadata."""
+        self,
+        component: ElementTree.Element,
+        firmware_blob_dir: Path,
+        firmware_url_base: str,
+    ) -> typing.Generator[FirmwareBlob, None, None]:
+        """
+        Process and update a component which is part of the repo metadata.
+
+        Extract and yield info of firmware blobs that need to be downloaded.
+        """
         component_id_element = component.find("id")
         if component_id_element is None or not component_id_element.text:
             LOGGER.warning("Component %s has no ID. Ignoring.", component)
             return
         component_id = component_id_element.text
 
-        if not filter_component_id(component_id, self.filter_ids):
+        if not filter_component_id(component_id, self.cfg.filter_ids):
             self._skipped_components += 1
             return
 
@@ -273,13 +356,13 @@ class LVFSMirror:
 
                 if not condition_compare or not condition_version:
                     LOGGER.warning(
-                        "Missing compare and/or version attribute for <firmware>vendor-id</firmare> requirement."
+                        "Missing compare and/or version attribute for <firmware>vendor-id</firmware> requirement."
                     )
                     continue
                 elif filter_vendor_id(
                     condition_version.upper(),
                     condition_compare.lower(),
-                    self.filter_vendor_ids,
+                    self.cfg.filter_vendor_ids,
                 ):
                     continue
                 else:
@@ -294,7 +377,8 @@ class LVFSMirror:
                 continue
             elif condition_element.tag == "hardware":
                 # Filtering by computer hardware (ID?) is not yet supported.
-                # I don't know how I can get a list of computer hardware IDs of devices on my computer.
+                # I don't know how I can get a list of computer hardware IDs
+                # of devices on my computer.
                 continue
             elif condition_element.tag == "client":
                 # This is used if this update requires user interaction.
@@ -347,10 +431,9 @@ class LVFSMirror:
                 )
                 continue
 
-            if release_url.path:
-                output_file = output_root / "downloads" / Path(release_url.path).name
-            else:
-                output_file = output_root / "downloads" / component_id
+            firmware_blob_name = (
+                Path(release_url.path).name if release_url.path else component_id
+            )
 
             checksums: dict[str, str] = {}
             for checksum in release.findall("checksum"):
@@ -372,19 +455,16 @@ class LVFSMirror:
                 if size_element.attrib.get("type") == "download" and size_element.text:
                     size = int(size_element.text)
 
-            new_release_path = self.download_and_verify_file(
+            output_path = firmware_blob_dir / firmware_blob_name
+            yield FirmwareBlob(
                 url=release_url_str,
                 expected_checksums=checksums,
                 expected_size=size,
-                output_file=output_file,
+                output_path=output_path,
             )
 
-            if new_release_path:
-                path = new_release_path.relative_to(self.mirror_root)
-                new_release_url = f"{self.root_url.rstrip('/')}/{path}"
-                location.text = new_release_url
-            # elif self.prune_metadata:
-            # -> remove from metadata
+            new_release_url = f"{firmware_url_base.rstrip('/')}/{firmware_blob_name}"
+            location.text = new_release_url
 
     def exclude_old_versions(
         self, release_elements: list[ElementTree.Element], component_id: str
@@ -395,7 +475,10 @@ class LVFSMirror:
         It filters a list of release elements from metadata XML.
         """
 
-        if not self.keep_versions or len(release_elements) <= self.keep_versions:
+        if (
+            not self.cfg.keep_versions
+            or len(release_elements) <= self.cfg.keep_versions
+        ):
             return release_elements
 
         EntryT = tuple[
@@ -508,7 +591,7 @@ class LVFSMirror:
             _release_id,
             version_fallback,
             release_element,
-        ) in elements_with_sort_key[: self.keep_versions]:
+        ) in elements_with_sort_key[: self.cfg.keep_versions]:
             release_elements.append(release_element)
             versions.append(".".join(version_fallback) if version_fallback else "???")
 
@@ -523,19 +606,13 @@ class LVFSMirror:
 
         return release_elements
 
-    def download_and_verify_file(
-        self,
-        url: str,
-        expected_checksums: dict[str, str],
-        expected_size: int | None,
-        output_file: Path,
-    ) -> Path | None:
+    def download_and_verify_firmware(
+        self, firmware_blob: FirmwareBlob, tmp_dir: Path, counter: str
+    ) -> None:
         """Download & verify firmware files."""
-        tmp_file = output_file.parent / f".{output_file.name}.part"
-
         size = 0
         checksums = {}
-        for checksum_type in expected_checksums.keys():
+        for checksum_type in firmware_blob.expected_checksums.keys():
             if checksum_type not in hashlib.algorithms_available:
                 LOGGER.warning("Unsupported checksum %s.", checksum_type)
                 continue
@@ -543,29 +620,31 @@ class LVFSMirror:
         checksums_str = ", ".join(checksums.keys())
 
         if not self.force and local_file_exists_and_up_to_date(
-            expected_checksums=expected_checksums,
-            expected_size=expected_size,
-            file_path=output_file,
+            expected_checksums=firmware_blob.expected_checksums,
+            expected_size=firmware_blob.expected_size,
+            file_path=firmware_blob.output_path,
         ):
             LOGGER.debug(
-                "File %s is up to date and valid (checksums %s match).",
-                output_file,
+                "Firmware file %s is up to date and valid (checksums %s match).",
+                firmware_blob.output_path,
                 checksums_str,
             )
-            return output_file
+            return
 
-        resp = self.session.request("GET", url, preload_content=False)
+        resp = self.session.request("GET", firmware_blob.url, preload_content=False)
+
+        tmp_file = tmp_dir / firmware_blob.output_path.name
 
         with TerminalLineUpdater() as printer:
             printer.update(
-                f"Downloading {output_file}: {human_file_size(size)}",
+                f"{counter} Downloading {firmware_blob.output_path}: {human_file_size(size)}",
                 on_non_terminals=True,
             )
 
             with tmp_file.open("wb") as file:
                 while chunk := resp.read(DOWNLOAD_CHUNK_SIZE):
                     printer.update(
-                        f"Downloading {output_file}: {human_file_size(size)}"
+                        f"{counter} Downloading {firmware_blob.output_path}: {human_file_size(size)}"
                     )
                     file.write(chunk)
                     for checksum_algo in checksums.values():
@@ -574,38 +653,42 @@ class LVFSMirror:
 
             self._downloaded_files += 1
             self._downloaded_size += size
-            printer.update(f"Downloaded {output_file}: {human_file_size(size)}")
+            printer.update(
+                f"{counter} Downloaded {firmware_blob.output_path}: {human_file_size(size)}"
+            )
 
-            if expected_size and size != expected_size:
+            if firmware_blob.expected_size and size != firmware_blob.expected_size:
                 LOGGER.warning(
-                    "Failed to download %s. Received %i bytes, expected %i bytes.",
-                    url,
+                    "%s Failed to download %s. Received %i bytes, expected %i bytes.",
+                    counter,
+                    firmware_blob.url,
                     size,
-                    expected_size,
+                    firmware_blob.expected_size,
                 )
                 os.unlink(tmp_file)
-                return None
+                return
 
             for checksum_type, checksum_value in checksums.items():
-                expected_checksum_value = expected_checksums[checksum_type]
+                expected_checksum_value = firmware_blob.expected_checksums[
+                    checksum_type
+                ]
                 if checksum_value.hexdigest().lower() != expected_checksum_value:
                     LOGGER.warning(
-                        "Failed to download %s. Checksum %s miss-match: expected %s got %s.",
-                        url,
+                        "%s Failed to download %s. Checksum %s miss-match: expected %s got %s.",
+                        counter,
+                        firmware_blob.url,
                         checksum_type,
                         expected_checksum_value,
                         checksum_value.hexdigest(),
                     )
                     os.unlink(tmp_file)
-                    return None
+                    return
 
-            tmp_file.rename(output_file)
+            tmp_file.rename(firmware_blob.output_path)
             printer.update(
-                f"Downloaded and verified {output_file} with checksums {checksums_str}",
+                f"{counter} Downloaded and verified {firmware_blob.output_path} with checksums {checksums_str}",
                 on_non_terminals=True,
             )
-
-        return output_file
 
 
 def parse_args() -> argparse.Namespace:
@@ -660,13 +743,8 @@ def main() -> None:
 
     cfg: Config = parse_config(args.config)
     mirror = LVFSMirror(
-        filter_ids=cfg.filter_ids,
-        filter_vendor_ids=cfg.filter_vendor_ids,
-        remotes=cfg.remotes,
-        mirror_root=cfg.mirror_root,
-        root_url=cfg.root_url,
+        cfg=cfg,
         force=args.force,
-        keep_versions=cfg.keep_versions,
     )
 
     try:

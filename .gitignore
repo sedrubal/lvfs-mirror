@@ -3,7 +3,15 @@ __pycache__
 .pyre/
 dist/
 
+# test mirror root
 root/
+# test remote configuration
 remotes.d/
+# test metadata and files
 *.xml
 *.xml.gz
+*.jcat
+*.cab
+
+# directory for test certificate and key
+pkcs7/

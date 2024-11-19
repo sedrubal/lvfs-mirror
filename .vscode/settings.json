@@ -1,3 +1,12 @@
 {
-  "cSpell.words": ["ensurepath", "freedesktop", "fwupd", "lvfs", "testpypi"]
+  "cSpell.words": [
+    "ensurepath",
+    "freedesktop",
+    "fwupd",
+    "jcat",
+    "KEEPALIVE",
+    "lvfs",
+    "pkcs",
+    "testpypi"
+  ]
 }

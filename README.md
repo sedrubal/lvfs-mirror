@@ -9,7 +9,15 @@ The configuration is by default stored under `/etc/lvfs_mirror/mirror.conf`
 or any path you give with `--config` / `-c`.
 An example configuration file can be found in `mirror.conf`.
 
+The configuration of remotes is the same as for fwupd.
+
+Details about signing and verifying can be found [here](https://github.com/hughsie/libjcat/).
+
 ## Installation
+
+### Dependencies
+
+This tool requires the tool `jcat-tool` available in the `PATH`.
 
 ### Production
 

@@ -1,9 +1,9 @@
 """Utils for lvfs_mirror."""
 
+import fnmatch
 import hashlib
 import logging
 import re
-import fnmatch
 import shutil
 import sys
 from gzip import GzipFile
@@ -117,7 +117,9 @@ def filter_component_id(component_id: str, filter_patterns: list[re.Pattern]) ->
     return False
 
 
-def filter_vendor_id(version: str, compare: str, filter_vendor_ids: list[str]) -> bool:
+def filter_vendor_id(
+    version: str, compare: str, filter_vendor_ids: frozenset[str]
+) -> bool:
     """:Return: True if one of the vendor ids in `filter_vendor_ids` matches the condition."""
     if not filter_vendor_ids:
         return True
