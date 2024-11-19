@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "lvfs-mirror"
-version = "0.3.0"
+version = "0.3.1"
 description = "Mirror for LVFS repositories (used for fwupd)."
 authors = ["Sebastian Endres <dev@sedrubal.de>"]
 license = "MIT"

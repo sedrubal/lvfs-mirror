@@ -45,19 +45,21 @@ def get_jcat_item(jcat_file_path: Path) -> str:
         )
 
 
-def jcat_verify_file(jcat_file_path: Path, public_keys_dir: Path) -> bool:
+def jcat_verify_file(
+    jcat_file_path: Path, public_keys_dir: Path, keyring_dir: Path
+) -> bool:
     """:return: True, if a jcat file validated successfully."""
+    cmd: list[str] = [
+        "jcat-tool",
+        "verify",
+        f"--keyring={keyring_dir.absolute()}",
+        f"--public-keys={public_keys_dir.absolute()}",
+        jcat_file_path.name,
+    ]
+    LOGGER.debug("Running command %s", " ".join(cmd))
     try:
-        subprocess.check_call(
-            [
-                "jcat-tool",
-                "verify",
-                f"--public-keys={public_keys_dir}",
-                jcat_file_path.name,
-            ],
-            # jcat-tool will search for the files to verify relative to the current directory.
-            cwd=jcat_file_path.parent,
-        )
+        # jcat-tool will search for the files to verify relative to the current directory.
+        subprocess.check_call(cmd, cwd=jcat_file_path.parent)
     except subprocess.CalledProcessError as err:
         if err.returncode == 1:
             LOGGER.error(
@@ -88,41 +90,35 @@ def jcat_sign_file(
     """
     assert jcat_file_path.parent == data_file_path.parent
     cwd = data_file_path.parent
-    pkcs7_cert_file_path = pkcs7_cert_file_path.absolute()
-    pkcs7_private_key_file_path = pkcs7_private_key_file_path.absolute()
 
-    LOGGER.debug("Signing using PKCS7 key...")
-    subprocess.check_call(
-        [
+    cmd: list[str] = [
+        "jcat-tool",
+        "sign",
+        jcat_file_path.name,
+        data_file_path.name,
+        str(pkcs7_cert_file_path.absolute()),
+        str(pkcs7_private_key_file_path.absolute()),
+    ]
+    LOGGER.debug("Signing using PKCS7 key with command %s", " ".join(cmd))
+    subprocess.check_call(cmd, cwd=cwd)
+    # cmd = [
+    #     "jcat-tool",
+    #     "import",
+    #     jcat_file_path.name,
+    #     data_file_path.name,
+    #     gpg_signature_file_path,
+    # ]
+    # LOGGER.debug("Signing using gpg key with command %s", " ".join(cmd))
+    # subprocess.check_call(cmd, cwd=cwd )
+    for checksum_algo in ("sha1", "sha256"):
+        cmd = [
             "jcat-tool",
-            "sign",
+            "self-sign",
             jcat_file_path.name,
             data_file_path.name,
-            pkcs7_cert_file_path,
-            pkcs7_private_key_file_path,
-        ],
-        cwd=cwd,
-    )
-    # LOGGER.debug("Signing using gpg key...")
-    # subprocess.check_call(
-    #     [
-    #         "jcat-tool",
-    #         "import",
-    #         jcat_file_path.name,
-    #         data_file_path.name,
-    #         gpg_signature_file_path,
-    #     ],
-    #     cwd=cwd,
-    # )
-    for checksum_algo in ("sha1", "sha256"):
-        LOGGER.debug("Creating %s checksum...", checksum_algo)
-        subprocess.check_call(
-            [
-                "jcat-tool",
-                "self-sign",
-                jcat_file_path.name,
-                data_file_path.name,
-                f"--kind={checksum_algo}",
-            ],
-            cwd=cwd,
+            f"--kind={checksum_algo}",
+        ]
+        LOGGER.debug(
+            "Creating %s checksum with command %s", checksum_algo, " ".join(cmd)
         )
+        subprocess.check_call(cmd, cwd=cwd)

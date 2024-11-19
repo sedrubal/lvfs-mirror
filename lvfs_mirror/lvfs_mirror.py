@@ -115,6 +115,8 @@ class LVFSMirror:
         jcat_output_path = tmp_root_out / jcat_file_name
         jcat_mirror_path = root / jcat_file_name
 
+        keyring_dir = tmp_root / "keyring"
+
         # download jcat file
         try:
             self.download_file(jcat_url, jcat_input_path)
@@ -135,7 +137,7 @@ class LVFSMirror:
         metadata_output_path = tmp_root_out / metadata_name
 
         if metadata_input_path.is_file() and jcat_verify_file(
-            jcat_input_path, self.cfg.public_keys_dir
+            jcat_input_path, self.cfg.public_keys_dir, keyring_dir
         ):
             LOGGER.info("Metadata %s is already downloaded and valid.", jcat_input_path)
         else:
@@ -147,7 +149,7 @@ class LVFSMirror:
                 LOGGER.error("Failed to update remote %s: %s", remote.name, exc)
                 return
 
-            if jcat_verify_file(jcat_input_path, self.cfg.public_keys_dir):
+            if jcat_verify_file(jcat_input_path, self.cfg.public_keys_dir, keyring_dir):
                 # metadata is valid
                 LOGGER.info(
                     "Successfully downloaded and verified metadata %s.",
@@ -261,7 +263,7 @@ class LVFSMirror:
         #         metadata = output_file_name.open("rb")
         # else:
 
-        input_file: typing.Union[gzip.GzipFile, typing.IO]
+        input_file: gzip.GzipFile | typing.IO
         src_mtime: int | None = None
         if metadata_input_path.suffix == ".gz":
             # extract output
@@ -273,7 +275,7 @@ class LVFSMirror:
         else:
             input_file = metadata_input_path.open("rb")
 
-        output_file: typing.Union[gzip.GzipFile, typing.IO]
+        output_file: gzip.GzipFile | typing.IO
         if metadata_output_path.suffix == ".gz":
             # compress output
             output_file = gzip.GzipFile(
