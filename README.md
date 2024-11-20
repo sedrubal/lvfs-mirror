@@ -5,7 +5,7 @@ that are used for [fwupd](https://fwupd.org/).
 
 ## Configuration
 
-The configuration is by default stored under `/etc/lvfs_mirror/mirror.conf`
+The configuration is by default stored under `/etc/lvfs-mirror/mirror.conf`
 or any path you give with `--config` / `-c`.
 An example configuration file can be found in `mirror.conf`.
 

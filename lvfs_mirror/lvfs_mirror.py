@@ -36,6 +36,15 @@ LOGGER = logging.getLogger()
 
 DOWNLOAD_CHUNK_SIZE = 1024
 
+#: A helper type.
+VersionEntryT = tuple[
+    Version | None,
+    int | None,
+    int | None,
+    list[str] | None,
+    ElementTree.Element,
+]
+
 
 @dataclass
 class FirmwareBlob:
@@ -45,6 +54,34 @@ class FirmwareBlob:
     expected_checksums: dict[str, str]
     expected_size: int | None
     output_path: Path
+
+    def __post_init__(self):
+        for checksum_algo in tuple(self.expected_checksums.keys()):
+            if checksum_algo not in hashlib.algorithms_available:
+                LOGGER.warning(
+                    "Unsupported checksum algorithm %s. Ignoring.", checksum_algo
+                )
+                self.expected_checksums.pop(checksum_algo)
+
+    def verify_firmware(self) -> bool:
+        """
+        Verify a local firmware blob
+
+        :return: True, if it exists and is valid.
+        """
+        if local_file_exists_and_up_to_date(
+            expected_checksums=self.expected_checksums,
+            expected_size=self.expected_size,
+            file_path=self.output_path,
+        ):
+            LOGGER.debug(
+                "Firmware file %s is up to date and valid (checksums %s match).",
+                self.output_path,
+                ", ".join(sorted(self.expected_checksums.keys())),
+            )
+            return True
+
+        return False
 
 
 class LVFSMirror:
@@ -157,7 +194,10 @@ class LVFSMirror:
                 )
             else:
                 LOGGER.error(
-                    "Metadata %s downloaded but verification with jcat %s failed. Skipping remote %s",
+                    (
+                        "Metadata %s downloaded but verification with jcat %s failed."
+                        " Skipping remote %s"
+                    ),
                     metadata_input_path,
                     jcat_input_path,
                     remote.name,
@@ -165,7 +205,7 @@ class LVFSMirror:
                 return
 
         # process metadata
-        firmware_blobs_to_download = list(
+        repo_firmware_blobs = list(
             self.process_metadata(
                 metadata_input_path=metadata_input_path,
                 metadata_output_path=metadata_output_path,
@@ -180,14 +220,35 @@ class LVFSMirror:
             self._skipped_components,
         )
 
-        # download & verify firmware blobs
-        LOGGER.info(
-            "%i firmware blobs will be made available locally...",
-            len(firmware_blobs_to_download),
+        total_repo_size = sum(
+            fw.expected_size for fw in repo_firmware_blobs if fw.expected_size
         )
-        total_str = str(len(firmware_blobs_to_download))
-        for idx, firmware_blob in enumerate(firmware_blobs_to_download, start=1):
-            counter = f"[{idx:>{len(total_str)}}/{total_str}]"
+        LOGGER.info(
+            "Repo will cache %i firmware blobs (%s)",
+            len(repo_firmware_blobs),
+            human_file_size(total_repo_size),
+        )
+
+        if not self.force:
+            # Validate local files and remove valid firmware blobs from list of blobs
+            # that we need to downlaoded.
+            repo_firmware_blobs = [
+                fw for fw in repo_firmware_blobs if not fw.verify_firmware()
+            ]
+
+        download_size = sum(
+            fw.expected_size for fw in repo_firmware_blobs if fw.expected_size
+        )
+        amount_fw_blobs_str = str(len(repo_firmware_blobs))
+        LOGGER.info(
+            "Will download %s firmware blobs (%s)...",
+            amount_fw_blobs_str,
+            human_file_size(download_size),
+        )
+
+        # download & verify firmware blobs
+        for idx, firmware_blob in enumerate(repo_firmware_blobs, start=1):
+            counter = f"[{idx:>{len(amount_fw_blobs_str)}}/{amount_fw_blobs_str}]"
             self.download_and_verify_firmware(firmware_blob, tmp_root, counter)
 
         # sign new metadata
@@ -242,26 +303,6 @@ class LVFSMirror:
         Write an updated version of the firmware and extract firmware blobs
         that need to be downloaded.
         """
-
-        # # check if we need to update the output file
-        # if (
-        #     not self.force
-        #     and src_mtime
-        #     and output_file_name.is_file()
-        #     and (dst_mtime := get_metadata_mtime(output_file_name) >= src_mtime)
-        # ):
-        #     LOGGER.info("Local metadata file for remote %s is up to date.", remote.name)
-        #     LOGGER.debug(
-        #         "Target file %s newer than source file (%i <= %i)",
-        #         output_file_name,
-        #         src_mtime,
-        #         dst_mtime,
-        #     )
-        #     if output_file_name.suffix == ".gz":
-        #         metadata = gzip.GzipFile(fileobj=output_file_name.open("rb"), mode="rb")
-        #     else:
-        #         metadata = output_file_name.open("rb")
-        # else:
 
         input_file: gzip.GzipFile | typing.IO
         src_mtime: int | None = None
@@ -477,20 +518,11 @@ class LVFSMirror:
         It filters a list of release elements from metadata XML.
         """
 
-        if (
-            not self.cfg.keep_versions
-            or len(release_elements) <= self.cfg.keep_versions
-        ):
+        keep_versions = self.cfg.keep_versions
+        if not keep_versions or len(release_elements) <= keep_versions:
             return release_elements
 
-        EntryT = tuple[
-            Version | None,
-            int | None,
-            int | None,
-            list[str] | None,
-            ElementTree.Element,
-        ]
-        elements_with_sort_key: list[EntryT] = []
+        elements_with_sort_key: list[VersionEntryT] = []
 
         version_usable = True
         timestamp_usable = True
@@ -568,14 +600,20 @@ class LVFSMirror:
             sort_idx = 3
         else:
             LOGGER.warning(
-                "Did not find a useable sort criteria for the release versions of component %s. Will download all versions.",
+                (
+                    "Did not find a useable sort criteria for the release versions of component %s."
+                    " Will download all versions."
+                ),
                 component_id,
             )
             return release_elements
 
         if sort_idx > 0:
             LOGGER.warning(
-                "Can't reliably sort release versions of component %s by their version. Latest version might not be available.",
+                (
+                    "Can't reliably sort release versions of component %s by their version."
+                    " Latest version might not be available."
+                ),
                 component_id,
             )
 
@@ -612,34 +650,18 @@ class LVFSMirror:
         self, firmware_blob: FirmwareBlob, tmp_dir: Path, counter: str
     ) -> None:
         """Download & verify firmware files."""
-        size = 0
         checksums = {}
         for checksum_type in firmware_blob.expected_checksums.keys():
-            if checksum_type not in hashlib.algorithms_available:
-                LOGGER.warning("Unsupported checksum %s.", checksum_type)
-                continue
             checksums[checksum_type] = hashlib.new(checksum_type)
-        checksums_str = ", ".join(checksums.keys())
-
-        if not self.force and local_file_exists_and_up_to_date(
-            expected_checksums=firmware_blob.expected_checksums,
-            expected_size=firmware_blob.expected_size,
-            file_path=firmware_blob.output_path,
-        ):
-            LOGGER.debug(
-                "Firmware file %s is up to date and valid (checksums %s match).",
-                firmware_blob.output_path,
-                checksums_str,
-            )
-            return
 
         resp = self.session.request("GET", firmware_blob.url, preload_content=False)
+        size = 0
 
         tmp_file = tmp_dir / firmware_blob.output_path.name
 
         with TerminalLineUpdater() as printer:
             printer.update(
-                f"{counter} Downloading {firmware_blob.output_path}: {human_file_size(size)}",
+                f"{counter} Downloading {firmware_blob.output_path}",
                 on_non_terminals=True,
             )
 
@@ -687,6 +709,7 @@ class LVFSMirror:
                     return
 
             tmp_file.rename(firmware_blob.output_path)
+            checksums_str = ", ".join(sorted(checksums.keys()))
             printer.update(
                 f"{counter} Downloaded and verified {firmware_blob.output_path} with checksums {checksums_str}",
                 on_non_terminals=True,
@@ -699,7 +722,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-c",
         "--config",
-        default="/etc/lvfs_mirror/mirror.conf",
+        default="/etc/lvfs-mirror/mirror.conf",
         type=Path,
         help="The path to the main config file (default %(default)s).",
     )

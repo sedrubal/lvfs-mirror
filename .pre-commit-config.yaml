@@ -29,6 +29,11 @@ repos:
     hooks:
       - id: isort
 
+  # - repo: https://github.com/facebook/pyre-check
+  #   rev: v0.9.23
+  #   hooks:
+  #     - id: pyre-check
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
     hooks:
