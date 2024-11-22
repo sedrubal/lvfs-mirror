@@ -520,6 +520,16 @@ typing-extensions = "*"
 typing-inspect = "*"
 
 [[package]]
+name = "pyxattr"
+version = "0.7.2"
+description = "Filesystem extended attributes for python"
+optional = false
+python-versions = ">=3.4"
+files = [
+    {file = "pyxattr-0.7.2.tar.gz", hash = "sha256:68477027e6d3310669f98aaef15393bfcd9b2823d7a7f00a6f1d91a3c971ae64"},
+]
+
+[[package]]
 name = "pyyaml"
 version = "6.0.2"
 description = "YAML parser and emitter for Python"
@@ -732,4 +742,4 @@ test = ["covdefaults (>=2.3)", "coverage (>=7.2.7)", "coverage-enable-subprocess
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11"
-content-hash = "b6ad768696d4588c699fa89ce5a0395126da091503b13155b3ca967c49f0cbc9"
+content-hash = "19dacd9781631ccdf1408def9eb91333817fe437af4d540e9fae9ba96b3b5e3e"

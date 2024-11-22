@@ -9,7 +9,11 @@ import sys
 from gzip import GzipFile
 from pathlib import Path
 
+import xattr  # pylint: disable=import-error
+
 LOGGER = logging.getLogger()
+
+CHUNK_SIZE = 1024
 
 
 def get_gzip_mtime(file_path: Path) -> int | None:
@@ -33,6 +37,7 @@ def local_file_exists_and_up_to_date(
     expected_checksums: dict[str, str],
     expected_size: int | None,
     file_path: Path,
+    use_xattrs: bool = True,
 ) -> bool:
     """:Return: True, if the local firmware file exists and is valid."""
     if not file_path.exists():
@@ -48,20 +53,59 @@ def local_file_exists_and_up_to_date(
         )
         return False
 
-    for checksum_type, expected_checksum_value in expected_checksums.items():
+    if use_xattrs:
+        checksums_not_yet_verified: dict[str, str] = {}
+        for checksum_type, expected_checksum_value in expected_checksums.items():
+            try:
+                xattr_checksum = xattr.get(
+                    file_path,
+                    f"user.checksum.{checksum_type}".encode("utf-8"),
+                ).decode("utf-8")
+                if xattr_checksum == expected_checksum_value:
+                    continue
+            except (OSError, UnicodeDecodeError):
+                pass
+
+            checksums_not_yet_verified[checksum_type] = expected_checksum_value
+
+        expected_checksums = checksums_not_yet_verified
+
+    if expected_checksums:
+        checksums = {}
+        for checksum_type in expected_checksums.keys():
+            checksums[checksum_type] = hashlib.new(checksum_type)
+
         with file_path.open("rb") as file:
-            checksum_value = (
-                hashlib.file_digest(file, checksum_type).hexdigest().lower()
-            )
-        if expected_checksum_value != checksum_value:
-            LOGGER.warning(
-                "Local file %s is invalid. Checksum %s miss-match: expected %s got %s.",
-                file_path,
-                checksum_type,
-                expected_checksum_value,
-                checksum_value,
-            )
-            return False
+            buffer = bytearray(2**18)  # Reusable buffer to reduce allocations.
+            buffer_view = memoryview(buffer)
+            while True:
+                size = file.readinto(buffer)
+                if size == 0:
+                    break  # EOF
+                for checksum_algo in checksums.values():
+                    checksum_algo.update(buffer_view[:size])
+
+        for checksum_type, expected_checksum_value in expected_checksums.items():
+            actual_checksum_digest = checksums[checksum_type].hexdigest().lower()
+
+            if expected_checksum_value != actual_checksum_digest:
+                LOGGER.warning(
+                    "Local file %s is invalid. Checksum %s miss-match: expected %s got %s.",
+                    file_path,
+                    checksum_type,
+                    expected_checksum_value,
+                    actual_checksum_digest,
+                )
+                return False
+
+            try:
+                xattr.set(
+                    file_path,
+                    f"user.checksum.{checksum_type}".encode("utf-8"),
+                    actual_checksum_digest.encode("utf-8"),
+                )
+            except OSError as err:
+                LOGGER.warning("Could not set file xattrs to %s: %s", file_path, err)
 
     return True
 

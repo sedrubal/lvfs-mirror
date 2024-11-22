@@ -52,6 +52,10 @@ class Config:
     #: Certificate to key that is used to sign metadata on the mirror.
     pkcs7_signing_cert: Path
 
+    #: The full key ID of the gpg key that is used to sign metadata on the mirror.
+    #: The private key must be imported in the user's keyring.
+    gpg_signing_key_id: str | None
+
 
 MAIN_SECTION = "mirror"
 REMOTE_SECTION = "fwupd Remote"
@@ -106,6 +110,8 @@ def parse_config(main_config_file: Path) -> Config:
         main_section.get("Pkcs7SigningCert", "/etc/ssl/private/lvfs-mirror.crt.pem")
     )
 
+    gpg_signing_key_id: str | None = main_section.get("GpgSigningKeyId")
+
     remotes_dir = Path(main_section.get("RemotesDir", fallback="/etc/fwupd/remotes.d/"))
 
     if not remotes_dir.is_absolute():
@@ -120,6 +126,7 @@ def parse_config(main_config_file: Path) -> Config:
         public_keys_dir=public_keys_dir,
         pkcs7_signing_key=pkcs7_signing_key,
         pkcs7_signing_cert=pkcs7_signing_cert,
+        gpg_signing_key_id=gpg_signing_key_id,
         remotes=[],
     )
 

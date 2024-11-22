@@ -1,4 +1,9 @@
-"""Minimal re-implementation of lib-jcat."""
+"""
+Helper functions for jcat files.
+
+This is a partial wrapper around jcat-tool.
+TODO we should reimplement relevant parts of lib-jcat in python.
+"""
 
 import gzip
 import json
@@ -76,7 +81,9 @@ def jcat_sign_file(
     jcat_file_path: Path,
     pkcs7_cert_file_path: Path,
     pkcs7_private_key_file_path: Path,
-    # gpg_private_key: Path,
+    gpg_signing_key_id: str | None = None,
+    gpg_keyring_path: Path | None = None,
+    alias: str | None = None,
 ) -> None:
     """
     Sign `data_file_path` and write signature jcat into `jcat_file_path`.
@@ -85,40 +92,94 @@ def jcat_sign_file(
     - sha1
     - sha256
     - pkcs7 signature
-
-    Not (yet) supported: gpg signature.
+    - gpg signature
     """
     assert jcat_file_path.parent == data_file_path.parent
     cwd = data_file_path.parent
 
-    cmd: list[str] = [
-        "jcat-tool",
-        "sign",
-        jcat_file_path.name,
-        data_file_path.name,
-        str(pkcs7_cert_file_path.absolute()),
-        str(pkcs7_private_key_file_path.absolute()),
-    ]
-    LOGGER.debug("Signing using PKCS7 key with command %s", " ".join(cmd))
-    subprocess.check_call(cmd, cwd=cwd)
-    # cmd = [
-    #     "jcat-tool",
-    #     "import",
-    #     jcat_file_path.name,
-    #     data_file_path.name,
-    #     gpg_signature_file_path,
-    # ]
-    # LOGGER.debug("Signing using gpg key with command %s", " ".join(cmd))
-    # subprocess.check_call(cmd, cwd=cwd )
+    cmds: list[tuple[list[str], str]] = []
+
     for checksum_algo in ("sha1", "sha256"):
-        cmd = [
-            "jcat-tool",
-            "self-sign",
-            jcat_file_path.name,
-            data_file_path.name,
-            f"--kind={checksum_algo}",
-        ]
-        LOGGER.debug(
-            "Creating %s checksum with command %s", checksum_algo, " ".join(cmd)
+        cmds.append(
+            (
+                [
+                    "jcat-tool",
+                    "self-sign",
+                    jcat_file_path.name,
+                    data_file_path.name,
+                    f"--kind={checksum_algo}",
+                ],
+                f"Creating {checksum_algo} checksum with command %s",
+            )
         )
+
+    cmds.append(
+        (
+            [
+                "jcat-tool",
+                "sign",
+                jcat_file_path.name,
+                data_file_path.name,
+                str(pkcs7_cert_file_path.absolute()),
+                str(pkcs7_private_key_file_path.absolute()),
+            ],
+            "Signing using PKCS7 key with command %s",
+        )
+    )
+
+    if gpg_keyring_path:
+        gpg_keyring_args = ["--no-default-keyring", f"--keyring={gpg_keyring_path}"]
+    else:
+        gpg_keyring_args = []
+
+    if gpg_signing_key_id:
+        gpg_signature_path = data_file_path.parent / f"{data_file_path.name}.asc"
+        cmds.append(
+            (
+                [
+                    "gpg",
+                    "--batch",
+                    "--yes",
+                    *gpg_keyring_args,
+                    "--armor",
+                    f"--output={gpg_signature_path.absolute()}",
+                    "--armor",
+                    f"--local-user={gpg_signing_key_id}",
+                    "--detach-sign",
+                    str(data_file_path.absolute()),
+                ],
+                "Signing with gpg using command %s",
+            )
+        )
+        cmds.append(
+            (
+                [
+                    "jcat-tool",
+                    "import",
+                    jcat_file_path.name,
+                    data_file_path.name,
+                    str(gpg_signature_path.absolute()),
+                    "--kind=gpg",
+                ],
+                "Importing gpg signature into jcat using command %s",
+            )
+        )
+
+    if alias:
+        cmds.append(
+            (
+                [
+                    "jcat-tool",
+                    "add-alias",
+                    jcat_file_path.name,
+                    data_file_path.name,
+                    alias,
+                ],
+                f"Adding alias {alias} with command %s",
+            )
+        )
+
+    # execute commands
+    for cmd, log in cmds:
+        LOGGER.debug(log, " ".join(cmd))
         subprocess.check_call(cmd, cwd=cwd)

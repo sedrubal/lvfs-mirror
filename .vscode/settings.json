@@ -7,6 +7,8 @@
     "KEEPALIVE",
     "lvfs",
     "pkcs",
-    "testpypi"
+    "testpypi",
+    "xattr",
+    "xattrs"
   ]
 }

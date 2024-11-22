@@ -19,6 +19,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 import urllib3
+import xattr  # pylint: disable=import-error
 from packaging.version import InvalidVersion, Version
 
 from .config import Config, Remote, parse_config
@@ -63,7 +64,7 @@ class FirmwareBlob:
                 )
                 self.expected_checksums.pop(checksum_algo)
 
-    def verify_firmware(self) -> bool:
+    def verify_firmware(self, use_xattrs: bool = True) -> bool:
         """
         Verify a local firmware blob
 
@@ -73,6 +74,7 @@ class FirmwareBlob:
             expected_checksums=self.expected_checksums,
             expected_size=self.expected_size,
             file_path=self.output_path,
+            use_xattrs=use_xattrs,
         ):
             LOGGER.debug(
                 "Firmware file %s is up to date and valid (checksums %s match).",
@@ -145,8 +147,11 @@ class LVFSMirror:
         firmware_url_base = f"{self.cfg.root_url.rstrip('/')}/{remote.name}/downloads/"
 
         remote_url_base = remote.metadata_uri[: remote.metadata_uri.rindex("/")]
+        metadata_name_original = remote.metadata_uri[
+            remote.metadata_uri.rindex("/") + 1 :
+        ]
         jcat_url = f"{remote.metadata_uri}.jcat"
-        jcat_file_name = jcat_url[jcat_url.rindex("/") + 1 :]
+        jcat_file_name = f"{metadata_name_original}.jcat"
 
         jcat_input_path = tmp_root_in / jcat_file_name
         jcat_output_path = tmp_root_out / jcat_file_name
@@ -168,7 +173,7 @@ class LVFSMirror:
             LOGGER.error("Skipping remote %s: %s", remote.name, err)
             return
 
-        metadata_mirror_path_default = root / "firmware.xml.gz"
+        metadata_mirror_path_default = root / metadata_name_original
         metadata_mirror_path = root / metadata_name
         metadata_input_path = tmp_root_in / metadata_name
         metadata_output_path = tmp_root_out / metadata_name
@@ -230,8 +235,9 @@ class LVFSMirror:
         )
 
         if not self.force:
+            LOGGER.info("Validating existing firmware blobs...")
             # Validate local files and remove valid firmware blobs from list of blobs
-            # that we need to downlaoded.
+            # that we need to downloaded.
             repo_firmware_blobs = [
                 fw for fw in repo_firmware_blobs if not fw.verify_firmware()
             ]
@@ -253,11 +259,12 @@ class LVFSMirror:
 
         # sign new metadata
         jcat_sign_file(
-            metadata_output_path,
-            jcat_output_path,
-            self.cfg.pkcs7_signing_cert,
-            self.cfg.pkcs7_signing_key,
-            # self.cfg.signing_gpg_key,
+            data_file_path=metadata_output_path,
+            jcat_file_path=jcat_output_path,
+            pkcs7_cert_file_path=self.cfg.pkcs7_signing_cert,
+            pkcs7_private_key_file_path=self.cfg.pkcs7_signing_key,
+            gpg_signing_key_id=self.cfg.gpg_signing_key_id,
+            alias=metadata_name_original,
         )
 
         # "publish" jcat and modified metadata file
@@ -696,14 +703,26 @@ class LVFSMirror:
                 expected_checksum_value = firmware_blob.expected_checksums[
                     checksum_type
                 ]
-                if checksum_value.hexdigest().lower() != expected_checksum_value:
+                actual_checksum_digest = checksum_value.hexdigest().lower()
+                if actual_checksum_digest == expected_checksum_value:
+                    try:
+                        xattr.set(
+                            tmp_file,
+                            f"user.checksum.{checksum_type}".encode("utf-8"),
+                            actual_checksum_digest.encode("utf-8"),
+                        )
+                    except OSError as err:
+                        LOGGER.warning(
+                            "Could not set file xattrs to %s: %s", tmp_file, err
+                        )
+                else:
                     LOGGER.warning(
                         "%s Failed to download %s. Checksum %s miss-match: expected %s got %s.",
                         counter,
                         firmware_blob.url,
                         checksum_type,
                         expected_checksum_value,
-                        checksum_value.hexdigest(),
+                        actual_checksum_digest,
                     )
                     os.unlink(tmp_file)
                     return
