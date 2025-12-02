@@ -1,35 +1,42 @@
-[tool.poetry]
+[project]
 name = "lvfs-mirror"
 version = "0.3.3"
 description = "Mirror for LVFS repositories (used for fwupd)."
-authors = ["Sebastian Endres <dev@sedrubal.de>"]
-license = "MIT"
 readme = "README.md"
+authors = [{ name = "Sebastian Endres", email = "dev@sedrubal.de" }]
+requires-python = ">=3.11,<4"
+license = "MIT"
+dependencies = [
+    "urllib3>=2.5,<3",
+    "packaging>=25,<26",
+    "pyxattr>=0.8,<0.9",
+]
 
-[tool.poetry.dependencies]
-python = "^3.11"
-urllib3 = "^2.2.3"
-packaging = "^23.0"
-pyxattr = "^0.7.2"
+[dependency-groups]
+dev = [
+    "isort>=7.0,<8",
+    "mypy>=1.19,<2",
+    "pre-commit>=4.5,<5",
+    "pylint>=4.0,<5",
+    "pyre-check>=0.9.25,<1",
+    "ruff>=0.14,<1",
+    "tox-uv>=1.29,<2",
+    "tox>=4.32,<5",
+]
 
-[tool.poetry.group.dev.dependencies]
-pylint = "^3.3.1"
-isort = "^5.13.2"
-black = "^24.8.0"
-mypy = "^1.11.2"
-ruff = "^0.6.8"
-pyre-check = "^0.9.22"
-pre-commit = "^3.8.0"
+[project.scripts]
+lvfs-mirror = "lvfs_mirror.lvfs_mirror:main"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
-
-[tool.poetry.scripts]
-lvfs-mirror = "lvfs_mirror.lvfs_mirror:main"
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+# requires = ["hatchling"]
+# build-backend = "hatchling.build"
 
 [tool.isort]
 profile = "black"
 
-# [tool.mypy]
+# [[tool.mypy.overrides]]
+# module = ["xattr"]
 # ignore_missing_imports = true
+# follow_untyped_imports = false

@@ -4,38 +4,29 @@
 # exclude: "^docs/ref/"
 
 repos:
-  - repo: https://github.com/ambv/black
-    rev: 24.2.0
-    hooks:
-      - id: black
-        language_version: python3
-
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.3.2
+    rev: v0.14.7
     hooks:
       - id: ruff
+        # Run the linter.
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
+        # Run the formatter.
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.9.0
+    rev: v1.19.0
     hooks:
       - id: mypy
-        additional_dependencies:
-          - types-pyyaml>=6.0.0.0
+        # additional_dependencies:
+        #   - types-pyyaml>=6.0.0.0
 
   - repo: https://github.com/PyCQA/isort
-    rev: 5.13.2
+    rev: 7.0.0
     hooks:
       - id: isort
 
-  # - repo: https://github.com/facebook/pyre-check
-  #   rev: v0.9.23
-  #   hooks:
-  #     - id: pyre-check
-
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
         exclude: '^.*\.md$'

@@ -130,7 +130,7 @@ class TerminalLineUpdater:
         terminal_width = shutil.get_terminal_size((-1, -1)).columns
         if sys.stderr.isatty() and terminal_width != -1:
             if len(text) > terminal_width:
-                text = f"…{text[-terminal_width + 1:]}"
+                text = f"…{text[-terminal_width + 1 :]}"
             print(f"\33[2K\r{text}", end="", flush=True, file=sys.stderr)
         elif on_non_terminals:
             print(text, file=sys.stderr)
